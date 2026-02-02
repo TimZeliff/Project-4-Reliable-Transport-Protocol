@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+
+import socket
+import sys
+from urllib.parse import urlparse
+import re
+import os
+
+# Takes client's command and server response, returns error if the server returns unexpected msg per given command
+def validate_server_msg(cmd, msg):
+  code = msg[0]
+  if (code == "1"):
+    return "More action is expected"
+  if (code == "2"):
+    return "Success!"
+  if (code == "3"):
+    return "More action is needed"
+  if (code == "4" or code == "5" or code == "6"):
+    raise Exception("There was an error returned by the FTP server for the command: " + cmd + "\nServer Message: " + msg)
+
+
+# Quits and closes open sockets
+def cleanUp(control_channel, data_channel):
+  #if a data channel is still open (shouldn't be), close the data channel socket
+  try:
+    if (data_channel is not None):
+      data_channel.close()
+  except:
+    pass
+  
+  #request to quit the server connection
+  response = message_server("QUIT\r\n", control_channel)
+  validate_server_msg("QUIT", response)
+
+  #close the control channel socket
+  control_channel.close()
+
+
+# Establishes connection to data channel
+def DataChannelConnection(control_channel):
+  #establish data chanel:
+  #set connection to 8-bit binary data mode
+  type_set = "TYPE I\r\n"
+  response = message_server(type_set, control_channel)
+  validate_server_msg("TYPE", response)
+
+  #set connection to stream mode
+  mode_set = "MODE S\r\n"
+  response = message_server(mode_set, control_channel)
+  validate_server_msg("MODE", response)
+  
+  #set connection to file-oriented mode
+  structure_set = "STRU F\r\n"
+  response = message_server(structure_set, control_channel)
+  validate_server_msg("STRU", response)
+
+  #request to open data channel
+  data_channel_request = "PASV\r\n"
+  response = message_server(data_channel_request, control_channel)
+  validate_server_msg("PASV", response)
+
+  #derive the data socket address and port from server message
+  response_args = response.split()[4]
+  response_numbers_list = re.findall(r'\d+', response_args)
+  data_address = response_numbers_list[0] + "." + response_numbers_list[1] + "." + response_numbers_list[2] + "." + response_numbers_list[3]
+  data_port = int(response_numbers_list[4]) * 256 + int(response_numbers_list[5])
+
+  # create a socket object
+  data_channel = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+  # establish connection with server
+  data_channel.connect((data_address, data_port))
+  return data_channel
+
+
+
+# Establishes connection to control channel
+def ControlChannelConnection(username, password, control_channel):
+  #send the inital messages to the server to start the control chanel:
+  #specify the user
+  user_authentication = "USER " + username + "\r\n"
+  response = message_server(user_authentication, control_channel)
+  validate_server_msg("USER", response)
+
+  #specify the user's password (if there is one)
+  if (password!=None):
+    password_authentication = "PASS " + password + "\r\n"
+    response = message_server(password_authentication, control_channel)
+    validate_server_msg("PASS", response)
+
+
+# Receive data heard from a given client
+def receive_data(client):
+  data = b""
+
+  #keep collecting data until the socket is closed by the server
+  while True:
+    chunk = client.recv(4096)
+    if chunk == b"":
+      break
+    data += chunk
+
+  #return the raw data
+  return data
+
+
+# Takes a message and client, returns the servers response message
+def message_server(msg, client):
+  #encode and send the message to the server
+  client.send(msg.encode())
+
+  data = b""
+  
+  #make sure we're collecting the entire packet - read till line break
+  while b"\n" not in data:
+    chunk = client.recv(4096)
+    if chunk == b"":
+      break
+    data += chunk
+
+  #receive message from the server and decode
+  return data.decode().strip()
+
+
+def main():
+
+  #input validation: need at least the required arguement (URL and Command) and script name
+  if (len(sys.argv) < 3 or len(sys.argv) > 5):
+    raise Exception("You don't have the correct number of arguments")
+  
+  operation = sys.argv[1]
+
+  #if there are more than a script name, opperation, and URL: there must be a local file
+  if (len(sys.argv) > 3):
+    #figure out which one is the local file and which is the URL, document the order
+    if (sys.argv[2].startswith("ftp://")):
+      fileFirst = False
+      url = urlparse(sys.argv[2])
+      local_file = sys.argv[3]
+    else:
+      fileFirst = True
+      local_file = sys.argv[2]
+      url = urlparse(sys.argv[3])
+
+  #otherwise, there is only a URL
+  else:
+    url = urlparse(sys.argv[2])
+
+
+  #required
+  hostname = url.hostname
+  path = url.path
+
+  #optional:
+  username = url.username or "anonymous"
+  password = url.password
+  port = url.port or 21
+
+  valid_commands = ['ls', 'rm', 'rmdir', 'mkdir', 'cp', 'mv']
+
+  #input validation:
+  if (operation not in valid_commands):
+    raise Exception("You did not enter a valid command")
+  
+
+  # create a socket object
+  control_channel = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+  # establish connection with server, read welcome msg
+  control_channel.connect((hostname, port))
+  welcome = control_channel.recv(4096).decode()
+  print(welcome)
+
+  #create a place holder for data channel socket (just in case)
+  data_channel = None
+
+  #establish control chanel
+  ControlChannelConnection(username, password, control_channel)
+
+  #if the entered cmd requires a data channel, establish one
+  if (operation == "ls" or operation == "mv" or operation == "cp"):
+    data_channel = DataChannelConnection(control_channel)
+    
+    #create the appropriate command(s) based on the command line input
+    #and send them to the server through the correct channel
+    if (operation == "ls"):
+      cmd_msg = "LIST "
+      cmd_msg = cmd_msg + path + "\r\n"
+      
+      #requires control channel connection
+      response = message_server(cmd_msg, control_channel)
+      validate_server_msg(cmd_msg.split()[0], response)
+      print(response)
+
+      # listen to server response and display (needs to decode since we dont want raw data)
+      print(receive_data(data_channel).decode())
+    
+    #if it requires a data channel and is not ls, it must have 2 args
+    else:
+      if (len(sys.argv) < 4):
+        raise Exception("mv and cp require two arguements")
+
+
+      #if local file came before the url, store the local file on the server
+      if (fileFirst):
+        cmd_msg = "STOR "
+        cmd_msg = cmd_msg + path + "\r\n"
+        
+        #requires control channel connection
+        response = message_server(cmd_msg, control_channel)
+        validate_server_msg(cmd_msg.split()[0], response)
+        print(response)
+
+        #open the specified file, read its raw data, and send it to the server
+        with open(local_file, "rb") as f:
+          data_channel.sendall(f.read())
+
+        #once complete, its our responsibility to close the data channel
+        data_channel.close()
+
+        #if the command is to move the file, we also have to delete the original
+        #in this case the original is stored locally
+        if (operation == "mv"):
+          os.remove(local_file)
+      
+      #if the url came first, store a file from the server on the local machine
+      else:
+        cmd_msg = "RETR "
+        cmd_msg = cmd_msg + path + "\r\n"
+        
+        #requires control channel connection
+        response = message_server(cmd_msg, control_channel)
+        validate_server_msg(cmd_msg.split()[0], response)
+        print(response)
+
+        # listen to server response (don't decode - we want raw data!)
+        server_data = receive_data(data_channel)
+        
+        #server's responsibility to close the data channel
+
+        #creates a new file on the local machine with the specified path and name
+        #write the servers raw data into this new file
+        # note: writes over files if they already exists
+        with open(local_file, "wb") as f:
+          f.write(server_data)
+
+        #if the command is to move the file, we also have to delete the original
+        #in this case the original is stored on the server
+        if (operation == "mv"):
+          cmd_msg = "DELE "
+          cmd_msg = cmd_msg + path + "\r\n"
+          
+          #requires control channel connection
+          response = message_server(cmd_msg, control_channel)
+          validate_server_msg(cmd_msg.split()[0], response)
+          print(response)
+
+
+
+  else:
+    #create the appropriate command based on the command line input  
+    if (operation == "rm"):
+      cmd_msg = "DELE "
+    
+    elif (operation == "rmdir"):
+      cmd_msg = "RMD "
+      
+    elif (operation == "mkdir"):
+      cmd_msg = "MKD "
+    
+    #send the command to the FTP server through the control channel
+    cmd_msg = cmd_msg + path + "\r\n"
+    response = message_server(cmd_msg, control_channel)
+    validate_server_msg(cmd_msg.split()[0], response)
+    print(response)
+
+
+  cleanUp(control_channel, data_channel)
+
+
+if __name__ == "__main__":
+    main()
+
